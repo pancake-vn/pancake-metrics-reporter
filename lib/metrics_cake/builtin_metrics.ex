@@ -1,11 +1,24 @@
 defmodule MetricsCake.BuiltinMetrics do
-  def new(metric) do
+  alias MetricsCake.ProcStats
+
+  # `built_in_metrics: [:cpu, {:disk_io, mount: "/cdn-storage"}, ...]`: atom hoặc {atom, opts}
+  def new(metric) when is_atom(metric), do: new({metric, []})
+
+  def new({metric, opts}) do
     Telemetry.Metrics.last_value(
       "pancake_metrics_reporter.built_in.#{metric}",
       event_name: [:pancake_metrics_reporter, :built_in, metric],
-      reporter_options: [poller: {15_000, fn -> gather_builtin_metric(metric) end}]
+      reporter_options: [poller: {15_000, fn -> gather_builtin_metric(metric, opts) end}]
     )
   end
+
+  # Tốc độ đọc/ghi, IOPS, await, % bận của thiết bị mount ở `mount` (mặc định "/")
+  def gather_builtin_metric(:disk_io, opts), do: ProcStats.disk_io(Keyword.get(opts, :mount, "/"))
+  # Gói bị drop theo interface
+  def gather_builtin_metric(:network_drops, _opts), do: ProcStats.network_drops()
+  # Retransmit, listen overflow, số kết nối TCP của cả host
+  def gather_builtin_metric(:tcp, _opts), do: ProcStats.tcp()
+  def gather_builtin_metric(metric, _opts), do: gather_builtin_metric(metric)
 
   def gather_builtin_metric(:cpu) do
     shell_command = ~c(top -b -n 5 -d 0.2 | awk '/load/{ LOAD=$0; next } /Cpu/{ print LOAD"\\n"$0}')
@@ -55,65 +68,9 @@ defmodule MetricsCake.BuiltinMetrics do
     metrics ++ [%{type: "beam_vm", value: :erlang.memory(:total)}]
   end
 
-  def gather_builtin_metric(:network) do
-    interfaces = ["eth0", "eth1"]
-
-    Enum.flat_map(interfaces, fn interface ->
-      shell_command = ~c(sudo iftop -tB -s 2 -i #{interface} | grep 'Total')
-      lines =
-        :os.cmd(shell_command)
-        |> List.to_string()
-        |> String.trim()
-        |> String.split("\n")
-
-      send_rate = Enum.find(lines, & String.contains?(&1, "Total send rate"))
-      receive_rate = Enum.find(lines, & String.contains?(&1, "Total receive rate"))
-
-      if send_rate && receive_rate do
-        to_number = fn string ->
-          if String.contains?(string, "."),
-            do: String.to_float(string),
-            else: String.to_integer(string)
-        end
-
-        convert_to_byte = fn
-          value, "B" -> value
-          value, "KB" -> value * 1024
-          value, "MB" -> value * 1024 * 1024
-        end
-
-        regex = ~r/([\d\.]+)(B|KB|MB)/
-        metrics = []
-        metrics =
-          case Regex.run(regex, send_rate) do
-            [_, value, unit] ->
-              metrics ++ [%{
-                direction: "egress",
-                interface: interface,
-                value: to_number.(value) |> convert_to_byte.(unit)
-              }]
-
-            nil -> metrics
-          end
-
-        metrics =
-          case Regex.run(regex, receive_rate) do
-            [_, value, unit] ->
-              metrics ++ [%{
-                direction: "ingress",
-                interface: interface,
-                value: to_number.(value) |> convert_to_byte.(unit)
-              }]
-
-            nil -> metrics
-          end
-
-        metrics
-      else
-        []
-      end
-    end)
-  end
+  # Băng thông vào/ra (byte/s) theo interface, đọc /proc/net/dev. Trước đây gọi `sudo iftop` cho
+  # eth0/eth1 mỗi lần poll; giữ nguyên dạng `%{direction, interface, value}` để app không phải sửa.
+  def gather_builtin_metric(:network), do: ProcStats.network()
 
   def gather_builtin_metric(:beam) do
     metrics = [

@@ -90,6 +90,36 @@ Options:
 
 - poller: bắt buộc. Tuple với format {interval, callback_fun}. Cứ mỗi interval ms, callback_fun sẽ được gọi và kết quả trả về sẽ được lưu lại vào giá trị của metric.
 
+## Built-in metrics
+
+Bật qua option `built_in_metrics` (mặc định `[:cpu, :memory, :network, :beam]`). Mỗi built-in là 1 last value metric
+tên `[:pancake_metrics_reporter, :built_in, <tên>]`, poll mỗi 15s; app tự format tên khi xuất bản như các metric khác.
+Phần tử là atom hoặc `{atom, opts}`:
+
+```elixir
+MetricsCake.start_link(
+  metrics: metrics_spec,
+  built_in_metrics: [:cpu, :memory, :beam, :network, :network_drops, :tcp, {:disk_io, mount: "/cdn-storage"}],
+  report_callback: &report/0
+)
+```
+
+| Built-in | Giá trị (`report.value`) | Nguồn |
+|---|---|---|
+| `:cpu`, `:memory`, `:beam` | `%{type, value, labels}` | `top`, `free`, BEAM |
+| `:network` | `%{direction: "ingress" \| "egress", interface, value}`, byte/s | `/proc/net/dev` (trước đây `sudo iftop` eth0/eth1) |
+| `:network_drops` | `%{type, value, unit, labels: %{interface}}`: `net_receive_drops`, `net_transmit_drops` (gói/s) | `/proc/net/dev` |
+| `:disk_io` (`mount`, mặc định `"/"`) | `%{type, value, unit, labels: %{device}}`: `disk_{read,write}` (byte/s), `disk_{read,write}_ops` (/s), `disk_{read,write}_await` (ms), `disk_util` (%), `disk_in_flight` | `/proc/diskstats` của thiết bị mount ở `mount` |
+| `:tcp` | `%{type, value, unit, labels}`: `tcp_retrans` (/s), `tcp_retrans_ratio` (% segment gửi), `tcp_listen_overflows` (/s), `tcp_established` | `/proc/net/snmp`, `/proc/net/netstat` (cả host) |
+
+Các built-in đọc /proc lấy mẫu 2 lần cách 2s rồi tính chênh lệch (chỉ chạy trên Linux, không cần sudo). Built-in có
+`unit` format chung được, ví dụ:
+
+```elixir
+%{metric: %{name: [:pancake_metrics_reporter, :built_in, m]}, report: report} when m in [:disk_io, :network_drops, :tcp] ->
+  Enum.map(report.value || [], &%{name: "myapp_" <> &1.type, value: &1.value, unit: &1.unit, labels: &1.labels})
+```
+
 ## Installation
 
 If [available in Hex](https://hex.pm/docs/publish), the package can be installed

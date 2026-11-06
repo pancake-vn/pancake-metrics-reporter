@@ -119,6 +119,11 @@ defmodule MetricsCake do
     end)
   end
 
+  defp init_metric(%Telemetry.Metrics.Counter{tags: [_ | _]} = metric) do
+    # Với counter có tags, thì cần tạo key tuỳ theo tag_value từ event, init bằng empty map
+    true = :ets.insert_new(:metrics_reporter_utils, {ets_key(metric), %{}, System.monotonic_time()})
+  end
+
   defp init_metric(%Telemetry.Metrics.Counter{} = metric) do
     #{key, counter, since}
     true = :ets.insert_new(:metrics_reporter_utils, {ets_key(metric), :counters.new(1, []), System.monotonic_time()})
@@ -144,6 +149,21 @@ defmodule MetricsCake do
   end
 
   defp init_metric(_), do: :noop
+
+  defp update_metric(%Telemetry.Metrics.Counter{tags: [_ | _]} = metric, measurement, metadata) do
+    tag_value = if metric.tag_values, do: metric.tag_values.(metadata), else: Map.take(metadata, metric.tags)
+    ets_key = ets_key(metric)
+    [{_, counters, _}] = :ets.lookup(:metrics_reporter_utils, ets_key)
+    case Map.get(counters, tag_value) do
+      nil ->
+        counter = :counters.new(1, [])
+        :ets.update_element(:metrics_reporter_utils, ets_key, {2, Map.put(counters, tag_value, counter)})
+        :counters.add(counter, 1, measurement || 1)
+
+      counter ->
+        :counters.add(counter, 1, measurement || 1)
+    end
+  end
 
   defp update_metric(%Telemetry.Metrics.Counter{} = metric, measurement, _metadata) do
     [{_, counter, _}] = :ets.lookup(:metrics_reporter_utils, ets_key(metric))
@@ -180,24 +200,39 @@ defmodule MetricsCake do
 
   defp update_metric(_, _, _), do: :noop
 
-  defp report_metric(%Telemetry.Metrics.Counter{} = metric) do
-    [{_, counter, since}] = :ets.lookup(:metrics_reporter_utils, ets_key(metric))
+  defp do_counter_report(counter, since, reporter_options) do
     value = :counters.get(counter, 1)
     :counters.sub(counter, 1, value)
-    :ets.update_element(:metrics_reporter_utils, ets_key(metric), {3, System.monotonic_time()})
     duration = System.convert_time_unit(
       System.monotonic_time() - since,
       :native,
       :millisecond
     )
 
-    sample_rate = metric.reporter_options[:sample_rate]
+    sample_rate = reporter_options[:sample_rate]
     value = if sample_rate, do: value / sample_rate, else: value
+    per_sec = Float.round(value / (duration / 1000), 2)
 
-    %{
-      metric: metric,
-      report: %{total: value, duration: duration, per_sec: Float.round(value / (duration / 1000), 2)}
-    }
+    %{total: value, duration: duration, per_sec: per_sec}
+  end
+
+  defp report_metric(%Telemetry.Metrics.Counter{tags: [_ | _]} = metric) do
+    [{_, counters, since}] = :ets.lookup(:metrics_reporter_utils, ets_key(metric))
+    report = Enum.map(counters, fn {tag_value, counter} ->
+      do_counter_report(counter, since, metric.reporter_options)
+      |> Map.put(:tag_value, tag_value)
+    end)
+
+    :ets.update_element(:metrics_reporter_utils, ets_key(metric), {3, System.monotonic_time()})
+    %{metric: metric, report: report}
+  end
+
+  defp report_metric(%Telemetry.Metrics.Counter{} = metric) do
+    [{_, counter, since}] = :ets.lookup(:metrics_reporter_utils, ets_key(metric))
+    report = do_counter_report(counter, since, metric.reporter_options)
+    :ets.update_element(:metrics_reporter_utils, ets_key(metric), {3, System.monotonic_time()})
+
+    %{metric: metric, report: report}
   end
 
   defp report_metric(%Telemetry.Metrics.Summary{} = metric) do
